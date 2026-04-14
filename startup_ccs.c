@@ -58,7 +58,12 @@ extern uint32_t __STACK_TOP;
 // the program if located at a start address other than 0.
 //
 //*****************************************************************************
+#if !defined(__clang__)
 #pragma DATA_SECTION(g_pfnVectors, ".intvecs")
+#endif
+#if defined(__clang__)
+__attribute__((section(".intvecs")))
+#endif
 void (* const g_pfnVectors[])(void) =
 {
     (void (*)(void))((uint32_t)&__STACK_TOP),
