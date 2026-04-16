@@ -101,28 +101,50 @@ For the current small repo, it is acceptable to reach Milestone 3 in one source 
   - playback stopped
   - current song index reset to start
   - LED shows idle color
-- `PLAYING`
-  - notes are advancing
-  - phrase changes update LED color
+- `LOAD_PHRASE`
+  - selects the current phrase's LED pattern
+  - prepares phrase-level bookkeeping before the next note is loaded
+- `LOAD_NOTE`
+  - reads the next note from the song table
+  - prepares frequency, duration, phrase ID, and rest/note status
+- `NOTE_ON`
+  - actively outputs the current note through PWM or DAC
+  - holds until the note duration expires
+- `NOTE_GAP`
+  - inserts a short rest between notes
+  - decides whether the next transition is another note, a new phrase, or song completion
 - `PAUSED`
   - current playback position retained
   - audio output muted or disabled
   - LED shows paused color
-- `SONG_DONE` (recommended)
+- `SONG_COMPLETE`
   - song completed
-  - LED shows completion color briefly
+  - audio output disabled
+  - LED shows completion color
   - next button press restarts song
+- `ERROR` (optional)
+  - unrecoverable hardware or data problem
+  - audio disabled
+  - LED shows an error pattern
 
-Only `IDLE`, `PLAYING`, and `PAUSED` are required. `SONG_DONE` makes end-of-song behavior cleaner and avoids overloading `IDLE`.
+This still satisfies the required `IDLE`, `PLAYING`, and `PAUSED` behavior, but it expands "playing" into concrete sub-states that match how the embedded software will actually work.
+
+For milestone grading, `LOAD_PHRASE`, `LOAD_NOTE`, `NOTE_ON`, and `NOTE_GAP` together represent the active playing region.
 
 ### Inputs / Events
 
 - `EVT_SW1_PRESS`
   - debounced falling-edge press on `PF4`
+- `EVT_PHRASE_READY`
+  - phrase LED/output setup has completed
+- `EVT_NOTE_READY`
+  - note frequency/duration setup has completed
 - `EVT_NOTE_DONE`
   - current note duration elapsed
+- `EVT_GAP_DONE`
+  - inter-note gap elapsed and the next note is in the same phrase
 - `EVT_PHRASE_DONE`
-  - current phrase boundary reached
+  - inter-note gap elapsed and the next note starts a new phrase
 - `EVT_SONG_DONE`
   - last note completed
 - `EVT_UART_PLAY` (Milestone 4)
@@ -132,13 +154,17 @@ Only `IDLE`, `PLAYING`, and `PAUSED` are required. `SONG_DONE` makes end-of-song
 
 ### Outputs / Actions
 
-- Start audio generation
-- Stop or mute audio generation
-- Advance to next note
-- Reset song position to first note
-- Change LED color for the current phrase
-- Send status text over UART
-- Refill the next DMA audio buffer
+- reset song index and phrase index
+- load the current phrase color
+- load the current note frequency and duration
+- start audio generation for the current note
+- stop audio for the inter-note gap
+- mute audio while paused
+- advance to the next note
+- advance to the next phrase
+- mark song completion
+- send state/status text over UART
+- refill the next DMA audio buffer
 
 ### Initial State
 
@@ -148,20 +174,38 @@ Only `IDLE`, `PLAYING`, and `PAUSED` are required. `SONG_DONE` makes end-of-song
   - phrase index = `0`
   - LED color = idle color, recommended `blue`
   - audio output disabled
+- resume state = `IDLE`
 
 ### State Transition Summary
 
 | Current State | Event | Next State | Action |
 |---|---|---|---|
-| `IDLE` | `EVT_SW1_PRESS` | `PLAYING` | reset song position, load first note, enable audio, set phrase 0 color |
-| `PLAYING` | `EVT_SW1_PRESS` | `PAUSED` | mute/disable audio, preserve indices |
-| `PAUSED` | `EVT_SW1_PRESS` | `PLAYING` | resume current note timing/audio |
-| `PLAYING` | `EVT_NOTE_DONE` | `PLAYING` | advance note, update tone |
-| `PLAYING` | `EVT_PHRASE_DONE` | `PLAYING` | update LED color |
-| `PLAYING` | `EVT_SONG_DONE` | `SONG_DONE` | stop audio, set done color |
-| `SONG_DONE` | `EVT_SW1_PRESS` | `PLAYING` | restart from first note |
+| `IDLE` | `EVT_SW1_PRESS` | `LOAD_PHRASE` | reset song position, reset phrase index |
+| `LOAD_PHRASE` | `EVT_PHRASE_READY` | `LOAD_NOTE` | apply phrase LED color |
+| `LOAD_NOTE` | `EVT_NOTE_READY` | `NOTE_ON` | load frequency and duration |
+| `NOTE_ON` | `EVT_NOTE_DONE` | `NOTE_GAP` | stop or mute audio |
+| `NOTE_GAP` | `EVT_GAP_DONE` | `LOAD_NOTE` | advance note index |
+| `NOTE_GAP` | `EVT_PHRASE_DONE` | `LOAD_PHRASE` | advance note index and phrase index |
+| `NOTE_GAP` | `EVT_SONG_DONE` | `SONG_COMPLETE` | stop audio and mark song complete |
+| any active playback state | `EVT_SW1_PRESS` | `PAUSED` | save previous state and mute audio |
+| `PAUSED` | `EVT_SW1_PRESS` | saved active state | resume previous playback sub-state |
+| `SONG_COMPLETE` | `EVT_SW1_PRESS` | `LOAD_PHRASE` | restart from first note |
 
-If `SONG_DONE` is omitted, transition back to `IDLE` after `EVT_SONG_DONE`.
+The code should store a `resume_state` so that pausing during `NOTE_ON`, `NOTE_GAP`, `LOAD_NOTE`, or `LOAD_PHRASE` resumes the correct sub-state instead of blindly returning to a generic playing state.
+
+### Milestone 2 Board Demo Mapping
+
+Until real audio timing is added, the board demo can use timed simulated events to walk through the active playback states:
+
+- `IDLE`: blue
+- `LOAD_PHRASE`: yellow
+- `LOAD_NOTE`: cyan
+- `NOTE_ON`: green
+- `NOTE_GAP`: white
+- `PAUSED`: red
+- `SONG_COMPLETE`: magenta
+
+This gives a visible way to verify that the expanded FSM is running even before PWM, note tables, and phrase timing are complete.
 
 ## 6. Song Representation
 

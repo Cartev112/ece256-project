@@ -3,6 +3,11 @@
 // blinky.c - Milestone 2 finite state machine scaffold for the TM4C music
 // player project.
 //
+// This version intentionally models more than "idle / playing / paused".
+// The active playing region is expanded into phrase setup, note setup, note
+// output, and note gap states so the FSM looks like the system we will build
+// for the music player rather than a generic three-state controller.
+//
 //*****************************************************************************
 
 #include <stdbool.h>
@@ -13,25 +18,36 @@
 #include "inc/hw_types.h"
 
 /*
- * The TM4C LaunchPad comes out of reset using the internal system clock.
- * For this milestone we intentionally keep that default clocking model and
- * avoid PLL setup so the FSM example stays focused on state behavior rather
- * than clock configuration.
+ * The TM4C LaunchPad comes out of reset using the internal 16 MHz system
+ * clock. Milestone 2 keeps that default to stay focused on the FSM. Later
+ * audio milestones should replace this with explicit clock/timer setup.
  */
-#define SYSTEM_CLOCK_HZ     16000000U
+#define SYSTEM_CLOCK_HZ             16000000U
 
 /*
- * The button is sampled periodically instead of using interrupts. A 5 ms
- * polling interval is slow enough to be simple and stable, but still fast
- * enough that the board feels responsive when SW1 is pressed by hand.
+ * SW1 is polled every 5 ms. The simulated playback events below are also
+ * expressed in poll ticks so this demo can run without interrupts or timers.
  */
-#define POLL_PERIOD_MS      5U
+#define POLL_PERIOD_MS              5U
+#define DEBOUNCE_SAMPLES            3U
 
 /*
- * A new switch level must be observed for this many consecutive samples
- * before the software accepts it as the debounced state.
+ * Demo timing constants. They are not real song timing yet; they just let the
+ * board visibly walk through the expanded FSM before audio is implemented.
  */
-#define DEBOUNCE_SAMPLES    3U
+#define LOAD_PHRASE_TICKS           40U     // 200 ms
+#define LOAD_NOTE_TICKS             20U     // 100 ms
+#define NOTE_ON_TICKS               80U     // 400 ms
+#define NOTE_GAP_TICKS              30U     // 150 ms
+
+/*
+ * Simulated song structure for Milestone 2. This approximates four phrases
+ * with four notes each. Milestone 3 will replace these constants with a real
+ * note table for Twinkle Twinkle Little Star.
+ */
+#define DEMO_NOTES_PER_PHRASE       4U
+#define DEMO_PHRASE_COUNT           4U
+#define DEMO_TOTAL_NOTES            (DEMO_NOTES_PER_PHRASE * DEMO_PHRASE_COUNT)
 
 /*
  * GPIO Port F bit assignments on the EK-TM4C123GXL LaunchPad:
@@ -40,51 +56,75 @@
  *   PF3 = green LED
  *   PF4 = SW1 pushbutton, active low
  */
-#define LED_RED_PIN         0x02U
-#define LED_BLUE_PIN        0x04U
-#define LED_GREEN_PIN       0x08U
-#define RGB_LED_PINS        (LED_RED_PIN | LED_BLUE_PIN | LED_GREEN_PIN)
-#define SW1_PIN             0x10U
+#define LED_RED_PIN                 0x02U
+#define LED_BLUE_PIN                0x04U
+#define LED_GREEN_PIN               0x08U
+#define LED_YELLOW_PINS             (LED_RED_PIN | LED_GREEN_PIN)
+#define LED_CYAN_PINS               (LED_BLUE_PIN | LED_GREEN_PIN)
+#define LED_MAGENTA_PINS            (LED_RED_PIN | LED_BLUE_PIN)
+#define LED_WHITE_PINS              (LED_RED_PIN | LED_BLUE_PIN | LED_GREEN_PIN)
+#define RGB_LED_PINS                LED_WHITE_PINS
+#define SW1_PIN                     0x10U
 
 /*
- * These are the three required Milestone 2 playback states.
+ * Expanded Milestone 2 state list.
  *
- * IDLE:
- *   The system is waiting for the user to start the show.
+ * STATE_IDLE:
+ *   Waiting for the user to start the show. Playback indices are reset.
  *
- * PLAYING:
- *   The system is conceptually "running." Milestone 2 does not yet generate
- *   audio, but this state stands in for active song playback.
+ * STATE_LOAD_PHRASE:
+ *   Phrase-level setup. This is where phrase LED patterns will be selected.
  *
- * PAUSED:
- *   The system has been temporarily halted and should later resume from the
- *   current playback position.
+ * STATE_LOAD_NOTE:
+ *   Note-level setup. This is where frequency, duration, and rest/note status
+ *   will be loaded from the song table.
+ *
+ * STATE_NOTE_ON:
+ *   Active note output. Milestone 3 will enable PWM or DAC output here.
+ *
+ * STATE_NOTE_GAP:
+ *   Short silence between notes. This gives the FSM a distinct place to
+ *   decide whether the next step is another note, a new phrase, or completion.
+ *
+ * STATE_PAUSED:
+ *   Playback is suspended. The code saves the state and tick count that were
+ *   active before pausing so resume returns to the correct sub-state.
+ *
+ * STATE_SONG_COMPLETE:
+ *   The simulated song has finished. A new SW1 press restarts from the top.
  */
 typedef enum
 {
     STATE_IDLE = 0,
-    STATE_PLAYING,
-    STATE_PAUSED
+    STATE_LOAD_PHRASE,
+    STATE_LOAD_NOTE,
+    STATE_NOTE_ON,
+    STATE_NOTE_GAP,
+    STATE_PAUSED,
+    STATE_SONG_COMPLETE
 } app_state_t;
 
 /*
- * Events are the FSM inputs. The state machine never directly examines the
- * pushbutton hardware; hardware sampling code translates raw input into one
- * of these abstract events first.
+ * FSM input events.
+ *
+ * Hardware and timing code translate raw conditions into these abstract
+ * events. The transition logic does not directly know about GPIO registers or
+ * software counters.
  */
 typedef enum
 {
     EVT_NONE = 0,
     EVT_SW1_PRESS,
+    EVT_PHRASE_READY,
+    EVT_NOTE_READY,
+    EVT_NOTE_DONE,
+    EVT_GAP_DONE,
+    EVT_PHRASE_DONE,
     EVT_SONG_DONE
 } app_event_t;
 
 /*
- * Each row describes one legal transition:
- *   current_state + event -> next_state
- *
- * Keeping the transitions in a table makes the state diagram explicit in
- * code and keeps the event handler simple.
+ * One row in the static transition table.
  */
 typedef struct
 {
@@ -94,53 +134,55 @@ typedef struct
 } fsm_transition_t;
 
 /*
- * This structure is the software model of the player's current status.
- * Milestone 2 only uses state, song_index, and phrase_index as placeholders,
- * but those fields are already laid out for Milestone 3 when real playback
- * timing and phrase-based LED changes will be added.
+ * Current application state.
+ *
+ * song_index:
+ *   The simulated note number. It will become the index into the real song
+ *   table in Milestone 3.
+ *
+ * phrase_index:
+ *   The simulated phrase number. It will drive phrase LED colors later.
+ *
+ * state_ticks:
+ *   Number of poll intervals spent in the current state.
+ *
+ * resume_state / resume_ticks:
+ *   Saved when pausing so resume returns to the correct active sub-state.
  */
 typedef struct
 {
     app_state_t state;
+    app_state_t resume_state;
     uint16_t song_index;
     uint8_t phrase_index;
+    uint16_t state_ticks;
+    uint16_t resume_ticks;
 } app_context_t;
 
 /*
- * Milestone 2 FSM definition
+ * Milestone 2 transition table.
  *
- * States:
- *   IDLE, PLAYING, PAUSED
- *
- * Inputs:
- *   EVT_SW1_PRESS, EVT_SONG_DONE
- *
- * Initial state:
- *   IDLE
- *
- * Outputs:
- *   IDLE    -> blue LED, song position reset
- *   PLAYING -> green LED
- *   PAUSED  -> red LED
+ * Pause and resume are handled as a small special case in HandleEvent() because
+ * PAUSED must return to whichever active state was interrupted.
  */
 static const fsm_transition_t g_fsm_transitions[] =
 {
-    { STATE_IDLE,    EVT_SW1_PRESS, STATE_PLAYING },
-    { STATE_PLAYING, EVT_SW1_PRESS, STATE_PAUSED  },
-    { STATE_PAUSED,  EVT_SW1_PRESS, STATE_PLAYING },
-    { STATE_PLAYING, EVT_SONG_DONE, STATE_IDLE    }
+    { STATE_IDLE,          EVT_SW1_PRESS,    STATE_LOAD_PHRASE  },
+    { STATE_LOAD_PHRASE,   EVT_PHRASE_READY, STATE_LOAD_NOTE    },
+    { STATE_LOAD_NOTE,     EVT_NOTE_READY,   STATE_NOTE_ON      },
+    { STATE_NOTE_ON,       EVT_NOTE_DONE,    STATE_NOTE_GAP     },
+    { STATE_NOTE_GAP,      EVT_GAP_DONE,     STATE_LOAD_NOTE    },
+    { STATE_NOTE_GAP,      EVT_PHRASE_DONE,  STATE_LOAD_PHRASE  },
+    { STATE_NOTE_GAP,      EVT_SONG_DONE,    STATE_SONG_COMPLETE },
+    { STATE_SONG_COMPLETE, EVT_SW1_PRESS,    STATE_LOAD_PHRASE  }
 };
 
 static void
 BoardInit(void)
 {
     /*
-     * Milestone 2 keeps the reset-default 16 MHz system clock and only
-     * configures the GPIO needed by the FSM demo.
-     *
-     * We enable Port F because it contains both the onboard RGB LED and SW1.
-     * The ready check ensures the peripheral clock is active before any
-     * registers on that port are touched.
+     * Enable Port F and wait until the peripheral is ready before touching
+     * any Port F registers.
      */
     HWREG(SYSCTL_RCGCGPIO) |= SYSCTL_RCGCGPIO_R5;
     while((HWREG(SYSCTL_PRGPIO) & SYSCTL_PRGPIO_R5) == 0U)
@@ -148,29 +190,26 @@ BoardInit(void)
     }
 
     /*
-     * Disable alternate and analog functions on the LED and switch pins so
-     * they behave as straightforward digital GPIO.
+     * Use PF1/PF2/PF3/PF4 as plain digital GPIO. Clearing AFSEL, AMSEL, and
+     * PCTL prevents alternate peripheral functions from taking over the pins.
      */
     HWREG(GPIO_PORTF_BASE + GPIO_O_AFSEL) &= ~(RGB_LED_PINS | SW1_PIN);
     HWREG(GPIO_PORTF_BASE + GPIO_O_AMSEL) &= ~(RGB_LED_PINS | SW1_PIN);
     HWREG(GPIO_PORTF_BASE + GPIO_O_PCTL) &= ~0x000FFFF0U;
 
     /*
-     * LEDs are outputs; SW1 remains an input.
+     * The RGB LED pins are outputs; SW1 is an input with an internal pull-up
+     * because the switch is active low.
      */
     HWREG(GPIO_PORTF_BASE + GPIO_O_DIR) =
         (HWREG(GPIO_PORTF_BASE + GPIO_O_DIR) & ~SW1_PIN) | RGB_LED_PINS;
-
-    /*
-     * SW1 is wired active low, so the internal pull-up keeps the pin at logic
-     * high when the switch is not pressed.
-     */
     HWREG(GPIO_PORTF_BASE + GPIO_O_PUR) |= SW1_PIN;
+    HWREG(GPIO_PORTF_BASE + GPIO_O_DEN) |= (RGB_LED_PINS | SW1_PIN);
 
     /*
-     * Digital-enable the LED and switch pins, then start with all LEDs off.
+     * Start with all LED channels off. The initial IDLE entry will turn blue
+     * on immediately after the application context is initialized.
      */
-    HWREG(GPIO_PORTF_BASE + GPIO_O_DEN) |= (RGB_LED_PINS | SW1_PIN);
     HWREG(GPIO_PORTF_BASE + (GPIO_O_DATA + (RGB_LED_PINS << 2))) = 0U;
 }
 
@@ -178,35 +217,66 @@ static void
 SetLedOutput(uint8_t ui8Pins)
 {
     /*
-     * TM4C GPIO uses an address-masked data access scheme. Shifting the pin
-     * mask by two selects a masked data alias so that only the RGB bits are
-     * written here.
+     * TM4C GPIO supports masked data aliases. This write affects only the
+     * PF1/PF2/PF3 LED bits and leaves the switch input untouched.
      */
     HWREG(GPIO_PORTF_BASE + (GPIO_O_DATA + (RGB_LED_PINS << 2))) = ui8Pins;
 }
 
-static void
-ApplyStateOutputs(app_context_t *psContext)
+static bool
+IsActivePlaybackState(app_state_t eState)
 {
     /*
-     * This function owns the outputs associated with each state.
-     * For Milestone 2 the visible output is just LED color, but the reset of
-     * song/phrase indices in IDLE already mirrors the intended playback model.
+     * These states are considered the expanded "PLAYING" region. A press of
+     * SW1 from any of them pauses playback.
+     */
+    return((eState == STATE_LOAD_PHRASE) ||
+           (eState == STATE_LOAD_NOTE) ||
+           (eState == STATE_NOTE_ON) ||
+           (eState == STATE_NOTE_GAP));
+}
+
+static void
+ApplyStateOutputs(const app_context_t *psContext)
+{
+    /*
+     * State-to-LED mapping for board testing:
+     *   IDLE          = blue
+     *   LOAD_PHRASE   = yellow
+     *   LOAD_NOTE     = cyan
+     *   NOTE_ON       = green
+     *   NOTE_GAP      = white
+     *   PAUSED        = red
+     *   SONG_COMPLETE = magenta
      */
     switch(psContext->state)
     {
         case STATE_IDLE:
-            psContext->song_index = 0U;
-            psContext->phrase_index = 0U;
             SetLedOutput(LED_BLUE_PIN);
             break;
 
-        case STATE_PLAYING:
+        case STATE_LOAD_PHRASE:
+            SetLedOutput(LED_YELLOW_PINS);
+            break;
+
+        case STATE_LOAD_NOTE:
+            SetLedOutput(LED_CYAN_PINS);
+            break;
+
+        case STATE_NOTE_ON:
             SetLedOutput(LED_GREEN_PIN);
+            break;
+
+        case STATE_NOTE_GAP:
+            SetLedOutput(LED_WHITE_PINS);
             break;
 
         case STATE_PAUSED:
             SetLedOutput(LED_RED_PIN);
+            break;
+
+        case STATE_SONG_COMPLETE:
+            SetLedOutput(LED_MAGENTA_PINS);
             break;
 
         default:
@@ -216,26 +286,97 @@ ApplyStateOutputs(app_context_t *psContext)
 }
 
 static void
+EnterState(app_context_t *psContext, app_state_t eNextState)
+{
+    /*
+     * Normal state entry resets the per-state timer. PAUSED resume is handled
+     * separately because it must restore the interrupted timer value.
+     */
+    psContext->state = eNextState;
+    psContext->state_ticks = 0U;
+    ApplyStateOutputs(psContext);
+}
+
+static void
+ResetPlaybackPosition(app_context_t *psContext)
+{
+    psContext->song_index = 0U;
+    psContext->phrase_index = 0U;
+    psContext->resume_state = STATE_IDLE;
+    psContext->resume_ticks = 0U;
+}
+
+static void
+ApplyTransitionAction(app_context_t *psContext, app_event_t eEvent)
+{
+    /*
+     * These actions update the simulated playback bookkeeping. They are kept
+     * separate from the transition table so the table stays readable.
+     */
+    switch(eEvent)
+    {
+        case EVT_SW1_PRESS:
+            if((psContext->state == STATE_IDLE) ||
+               (psContext->state == STATE_SONG_COMPLETE))
+            {
+                ResetPlaybackPosition(psContext);
+            }
+            break;
+
+        case EVT_GAP_DONE:
+            psContext->song_index++;
+            break;
+
+        case EVT_PHRASE_DONE:
+            psContext->song_index++;
+            psContext->phrase_index++;
+            break;
+
+        case EVT_SONG_DONE:
+            psContext->song_index = DEMO_TOTAL_NOTES;
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void
 HandleEvent(app_context_t *psContext, app_event_t eEvent)
 {
     uint32_t ui32Index;
 
-    /*
-     * No event means there is nothing to do this loop iteration.
-     */
     if(eEvent == EVT_NONE)
     {
         return;
     }
 
     /*
-     * Search the transition table for a row that matches the current state
-     * and incoming event. When a legal transition is found, move to the next
-     * state and immediately apply that state's outputs.
-     *
-     * If no row matches, the event is ignored. That is acceptable here and is
-     * often desirable in FSMs because not every event is meaningful in every
-     * state.
+     * SW1 is a control event that can interrupt any active playback sub-state.
+     * The FSM saves both the current state and the elapsed state time before
+     * entering PAUSED.
+     */
+    if((eEvent == EVT_SW1_PRESS) && IsActivePlaybackState(psContext->state))
+    {
+        psContext->resume_state = psContext->state;
+        psContext->resume_ticks = psContext->state_ticks;
+        EnterState(psContext, STATE_PAUSED);
+        return;
+    }
+
+    /*
+     * Pressing SW1 while paused resumes exactly where the FSM was interrupted.
+     */
+    if((eEvent == EVT_SW1_PRESS) && (psContext->state == STATE_PAUSED))
+    {
+        psContext->state = psContext->resume_state;
+        psContext->state_ticks = psContext->resume_ticks;
+        ApplyStateOutputs(psContext);
+        return;
+    }
+
+    /*
+     * Standard table-driven transition handling for all non-pause cases.
      */
     for(ui32Index = 0U;
         ui32Index < (sizeof(g_fsm_transitions) / sizeof(g_fsm_transitions[0]));
@@ -244,28 +385,82 @@ HandleEvent(app_context_t *psContext, app_event_t eEvent)
         if((g_fsm_transitions[ui32Index].current_state == psContext->state) &&
            (g_fsm_transitions[ui32Index].event == eEvent))
         {
-            psContext->state = g_fsm_transitions[ui32Index].next_state;
-            ApplyStateOutputs(psContext);
+            ApplyTransitionAction(psContext, eEvent);
+            EnterState(psContext, g_fsm_transitions[ui32Index].next_state);
             return;
         }
     }
 }
 
 static app_event_t
+GenerateTimedEvent(app_context_t *psContext)
+{
+    uint16_t ui16NextNote;
+
+    /*
+     * The timer model is deliberately simple for Milestone 2. It creates
+     * artificial events after a state has been active for a fixed number of
+     * polling ticks. Real note durations will replace this in Milestone 3.
+     */
+    if(!IsActivePlaybackState(psContext->state))
+    {
+        return EVT_NONE;
+    }
+
+    psContext->state_ticks++;
+
+    switch(psContext->state)
+    {
+        case STATE_LOAD_PHRASE:
+            if(psContext->state_ticks >= LOAD_PHRASE_TICKS)
+            {
+                return EVT_PHRASE_READY;
+            }
+            break;
+
+        case STATE_LOAD_NOTE:
+            if(psContext->state_ticks >= LOAD_NOTE_TICKS)
+            {
+                return EVT_NOTE_READY;
+            }
+            break;
+
+        case STATE_NOTE_ON:
+            if(psContext->state_ticks >= NOTE_ON_TICKS)
+            {
+                return EVT_NOTE_DONE;
+            }
+            break;
+
+        case STATE_NOTE_GAP:
+            if(psContext->state_ticks >= NOTE_GAP_TICKS)
+            {
+                ui16NextNote = psContext->song_index + 1U;
+
+                if(ui16NextNote >= DEMO_TOTAL_NOTES)
+                {
+                    return EVT_SONG_DONE;
+                }
+
+                if((ui16NextNote % DEMO_NOTES_PER_PHRASE) == 0U)
+                {
+                    return EVT_PHRASE_DONE;
+                }
+
+                return EVT_GAP_DONE;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return EVT_NONE;
+}
+
+static app_event_t
 PollSwitchEvent(void)
 {
-    /*
-     * These static variables preserve debounce history across calls.
-     *
-     * bLastSamplePressed:
-     *   Most recent raw sample level from SW1.
-     *
-     * bStablePressed:
-     *   Last accepted debounced switch level.
-     *
-     * ui8StableSamples:
-     *   Number of consecutive polls that matched bLastSamplePressed.
-     */
     static bool bLastSamplePressed = false;
     static bool bStablePressed = false;
     static uint8_t ui8StableSamples = 0U;
@@ -273,19 +468,12 @@ PollSwitchEvent(void)
     bool bSamplePressed;
 
     /*
-     * SW1 is active low. A raw read of zero on PF4 therefore means
-     * "the button is currently pressed."
+     * SW1 is active low, so a zero on PF4 means "pressed."
      */
     bSamplePressed =
         ((HWREG(GPIO_PORTF_BASE + (GPIO_O_DATA + (SW1_PIN << 2))) & SW1_PIN) ==
          0U);
 
-    /*
-     * Standard debounce strategy:
-     *   - if the new sample matches the previous raw sample, increment the
-     *     stability counter
-     *   - if the sample changes, restart the counter
-     */
     if(bSamplePressed == bLastSamplePressed)
     {
         if(ui8StableSamples < DEBOUNCE_SAMPLES)
@@ -300,9 +488,8 @@ PollSwitchEvent(void)
     }
 
     /*
-     * Once the raw level has remained stable long enough, compare it to the
-     * last debounced level. A change from released to pressed generates the
-     * single button event consumed by the FSM.
+     * Only the released-to-pressed edge creates an FSM event. The release edge
+     * updates debounce state but does not change playback state.
      */
     if((ui8StableSamples >= DEBOUNCE_SAMPLES) &&
        (bSamplePressed != bStablePressed))
@@ -324,13 +511,8 @@ WaitForNextPoll(void)
     volatile uint32_t ui32DelayCount;
 
     /*
-     * This is a simple busy-wait used only for the milestone demo. The magic
-     * factor of 3 comes from the approximate cycle cost of a decrement-and-test
-     * software delay loop on this class of microcontroller.
-     *
-     * Later milestones should replace this with SysTick or a hardware timer so
-     * note timing, pause behavior, and UART integration are all time-based
-     * rather than loop-speed based.
+     * Temporary software delay for Milestone 2. Hardware timers should replace
+     * this before note playback is implemented.
      */
     ui32DelayCount = SYSTEM_CLOCK_HZ / (3U * (1000U / POLL_PERIOD_MS));
     while(ui32DelayCount > 0U)
@@ -344,33 +526,27 @@ main(void)
 {
     app_context_t sAppContext;
 
-    /*
-     * Bring the board GPIO into a known state before the state machine starts.
-     */
     BoardInit();
 
     /*
-     * The specification says the initial state is IDLE. ApplyStateOutputs()
-     * makes that visible on the board immediately by setting the LED to blue
-     * and resetting playback bookkeeping fields.
+     * Explicit initial state required by the FSM design.
      */
     sAppContext.state = STATE_IDLE;
+    sAppContext.resume_state = STATE_IDLE;
     sAppContext.song_index = 0U;
     sAppContext.phrase_index = 0U;
+    sAppContext.state_ticks = 0U;
+    sAppContext.resume_ticks = 0U;
     ApplyStateOutputs(&sAppContext);
 
-    /*
-     * Main control loop:
-     *   1. sample SW1 and convert raw hardware input to an abstract event
-     *   2. feed that event into the FSM
-     *   3. wait until the next poll interval
-     *
-     * Milestone 3 will extend this loop with note timing, audio output, and
-     * phrase-based LED synchronization.
-     */
     while(1)
     {
+        /*
+         * Prioritize user input so a button press can pause before an
+         * automatically generated timing event advances the FSM.
+         */
         HandleEvent(&sAppContext, PollSwitchEvent());
+        HandleEvent(&sAppContext, GenerateTimedEvent(&sAppContext));
         WaitForNextPoll();
     }
 }
