@@ -1,7 +1,6 @@
 //*****************************************************************************
 //
-// blinky.c - Milestone 2 finite state machine scaffold for the TM4C music
-// player project.
+// blinky.c - FSM-driven TM4C music player scaffold.
 //
 // This version intentionally models more than "idle / playing / paused".
 // The active playing region is expanded into phrase setup, note setup, note
@@ -14,40 +13,60 @@
 #include <stdint.h>
 #include "inc/hw_gpio.h"
 #include "inc/hw_memmap.h"
+#include "inc/hw_nvic.h"
+#include "inc/hw_pwm.h"
 #include "inc/hw_sysctl.h"
 #include "inc/hw_types.h"
 
 /*
  * The TM4C LaunchPad comes out of reset using the internal 16 MHz system
- * clock. Milestone 2 keeps that default to stay focused on the FSM. Later
- * audio milestones should replace this with explicit clock/timer setup.
+ * clock. This milestone keeps that default to avoid introducing PLL setup
+ * before we need tighter timing.
  */
 #define SYSTEM_CLOCK_HZ             16000000U
+#define PWM_CLOCK_HZ                SYSTEM_CLOCK_HZ
 
 /*
- * SW1 is polled every 5 ms. The simulated playback events below are also
- * expressed in poll ticks so this demo can run without interrupts or timers.
+ * SysTick interrupts every 5 ms. Song durations are converted to these ticks.
+ * The main loop only advances button debounce and playback timing after the
+ * interrupt sets a tick flag.
  */
-#define POLL_PERIOD_MS              5U
+#define SYSTICK_PERIOD_MS           5U
 #define DEBOUNCE_SAMPLES            3U
 
 /*
- * Demo timing constants. They are not real song timing yet; they just let the
- * board visibly walk through the expanded FSM before audio is implemented.
+ * Short setup states keep the expanded FSM explicit without adding an obvious
+ * delay between notes. The note duration itself comes from the song table.
  */
-#define LOAD_PHRASE_TICKS           40U     // 200 ms
-#define LOAD_NOTE_TICKS             20U     // 100 ms
-#define NOTE_ON_TICKS               80U     // 400 ms
-#define NOTE_GAP_TICKS              30U     // 150 ms
+#define LOAD_PHRASE_TICKS           1U
+#define LOAD_NOTE_TICKS             1U
+#define NOTE_GAP_TICKS              10U     // 50 ms
 
 /*
- * Simulated song structure for Milestone 2. This approximates four phrases
- * with four notes each. Milestone 3 will replace these constants with a real
- * note table for Twinkle Twinkle Little Star.
+ * PB6 is M0PWM0 on the TM4C123GH6PM. Connect this pin to the input of a small
+ * speaker driver, powered buzzer input, or RC filter/amplifier. Do not drive a
+ * bare low-impedance speaker directly from the microcontroller pin.
+ *
+ * PB0-PB3 are also configured as plain digital outputs so the code can drive
+ * the external LED bank used by audio.c without interfering with PB6 PWM.
  */
-#define DEMO_NOTES_PER_PHRASE       4U
-#define DEMO_PHRASE_COUNT           4U
-#define DEMO_TOTAL_NOTES            (DEMO_NOTES_PER_PHRASE * DEMO_PHRASE_COUNT)
+#define PORTB_LED_PINS             0x0FU
+#define AUDIO_PWM_PIN               0x40U
+#define GPIO_PCTL_PB6_M0PWM0_VALUE  0x04000000U
+
+#define NOTE_REST_HZ                0U
+#define NOTE_C4_HZ                  262U
+#define NOTE_D4_HZ                  294U
+#define NOTE_E4_HZ                  330U
+#define NOTE_F4_HZ                  349U
+#define NOTE_G4_HZ                  392U
+#define NOTE_A4_HZ                  440U
+
+#define QUARTER_NOTE_MS             400U
+#define HALF_NOTE_MS                800U
+
+static volatile bool g_bSysTickElapsed = false;
+static volatile uint32_t g_ui32SystemTicks = 0U;
 
 /*
  * GPIO Port F bit assignments on the EK-TM4C123GXL LaunchPad:
@@ -67,7 +86,7 @@
 #define SW1_PIN                     0x10U
 
 /*
- * Expanded Milestone 2 state list.
+ * Expanded playback state list.
  *
  * STATE_IDLE:
  *   Waiting for the user to start the show. Playback indices are reset.
@@ -91,7 +110,7 @@
  *   active before pausing so resume returns to the correct sub-state.
  *
  * STATE_SONG_COMPLETE:
- *   The simulated song has finished. A new SW1 press restarts from the top.
+ *   The song has finished. A new SW1 press restarts from the top.
  */
 typedef enum
 {
@@ -134,14 +153,32 @@ typedef struct
 } fsm_transition_t;
 
 /*
+ * One playable item in the song table.
+ *
+ * frequency_hz:
+ *   Target PWM frequency. A value of NOTE_REST_HZ mutes the output.
+ *
+ * duration_ms:
+ *   How long the note should sound before entering NOTE_GAP.
+ *
+ * phrase_id:
+ *   Phrase grouping used to synchronize LED color changes with the music.
+ */
+typedef struct
+{
+    uint16_t frequency_hz;
+    uint16_t duration_ms;
+    uint8_t phrase_id;
+} note_t;
+
+/*
  * Current application state.
  *
  * song_index:
- *   The simulated note number. It will become the index into the real song
- *   table in Milestone 3.
+ *   The active note's index in the Twinkle song table.
  *
  * phrase_index:
- *   The simulated phrase number. It will drive phrase LED colors later.
+ *   Current phrase number, used for LED color synchronization.
  *
  * state_ticks:
  *   Number of poll intervals spent in the current state.
@@ -160,7 +197,72 @@ typedef struct
 } app_context_t;
 
 /*
- * Milestone 2 transition table.
+ * Twinkle Twinkle Little Star in C major.
+ *
+ * The phrase IDs follow the common line structure:
+ *   0: C C G G A A G
+ *   1: F F E E D D C
+ *   2: G G F F E E D
+ *   3: G G F F E E D
+ *   4: C C G G A A G
+ *   5: F F E E D D C
+ */
+static const note_t g_twinkle_song[] =
+{
+    { NOTE_C4_HZ, QUARTER_NOTE_MS, 0U },
+    { NOTE_C4_HZ, QUARTER_NOTE_MS, 0U },
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 0U },
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 0U },
+    { NOTE_A4_HZ, QUARTER_NOTE_MS, 0U },
+    { NOTE_A4_HZ, QUARTER_NOTE_MS, 0U },
+    { NOTE_G4_HZ, HALF_NOTE_MS,    0U },
+
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 1U },
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 1U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 1U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 1U },
+    { NOTE_D4_HZ, QUARTER_NOTE_MS, 1U },
+    { NOTE_D4_HZ, QUARTER_NOTE_MS, 1U },
+    { NOTE_C4_HZ, HALF_NOTE_MS,    1U },
+
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 2U },
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 2U },
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 2U },
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 2U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 2U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 2U },
+    { NOTE_D4_HZ, HALF_NOTE_MS,    2U },
+
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 3U },
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 3U },
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 3U },
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 3U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 3U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 3U },
+    { NOTE_D4_HZ, HALF_NOTE_MS,    3U },
+
+    { NOTE_C4_HZ, QUARTER_NOTE_MS, 4U },
+    { NOTE_C4_HZ, QUARTER_NOTE_MS, 4U },
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 4U },
+    { NOTE_G4_HZ, QUARTER_NOTE_MS, 4U },
+    { NOTE_A4_HZ, QUARTER_NOTE_MS, 4U },
+    { NOTE_A4_HZ, QUARTER_NOTE_MS, 4U },
+    { NOTE_G4_HZ, HALF_NOTE_MS,    4U },
+
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 5U },
+    { NOTE_F4_HZ, QUARTER_NOTE_MS, 5U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 5U },
+    { NOTE_E4_HZ, QUARTER_NOTE_MS, 5U },
+    { NOTE_D4_HZ, QUARTER_NOTE_MS, 5U },
+    { NOTE_D4_HZ, QUARTER_NOTE_MS, 5U },
+    { NOTE_C4_HZ, HALF_NOTE_MS,    5U }
+};
+
+#define TWINKLE_NOTE_COUNT \
+    ((uint16_t)(sizeof(g_twinkle_song) / sizeof(g_twinkle_song[0])))
+
+/*
+ * Playback transition table.
  *
  * Pause and resume are handled as a small special case in HandleEvent() because
  * PAUSED must return to whichever active state was interrupted.
@@ -177,15 +279,23 @@ static const fsm_transition_t g_fsm_transitions[] =
     { STATE_SONG_COMPLETE, EVT_SW1_PRESS,    STATE_LOAD_PHRASE  }
 };
 
+static void AudioStop(void);
+static void SetPortBLedOutput(uint8_t ui8Pins);
+
 static void
 BoardInit(void)
 {
     /*
-     * Enable Port F and wait until the peripheral is ready before touching
-     * any Port F registers.
+     * Enable Port F for the onboard RGB LED and SW1. Enable Port B and PWM0
+     * for PB0-PB3 LED output and PB6/M0PWM0 audio output.
      */
-    HWREG(SYSCTL_RCGCGPIO) |= SYSCTL_RCGCGPIO_R5;
-    while((HWREG(SYSCTL_PRGPIO) & SYSCTL_PRGPIO_R5) == 0U)
+    HWREG(SYSCTL_RCGCGPIO) |= (SYSCTL_RCGCGPIO_R5 | SYSCTL_RCGCGPIO_R1);
+    HWREG(SYSCTL_RCGCPWM) |= SYSCTL_RCGCPWM_R0;
+    while((HWREG(SYSCTL_PRGPIO) & (SYSCTL_PRGPIO_R5 | SYSCTL_PRGPIO_R1)) !=
+          (SYSCTL_PRGPIO_R5 | SYSCTL_PRGPIO_R1))
+    {
+    }
+    while((HWREG(SYSCTL_PRPWM) & SYSCTL_PRPWM_R0) == 0U)
     {
     }
 
@@ -211,6 +321,30 @@ BoardInit(void)
      * on immediately after the application context is initialized.
      */
     HWREG(GPIO_PORTF_BASE + (GPIO_O_DATA + (RGB_LED_PINS << 2))) = 0U;
+
+    /*
+     * PB0-PB3 are used as plain digital outputs for the external LED bank from
+     * audio.c. PB6 becomes M0PWM0. The PCTL field for PB6 is bits 27:24.
+     */
+    HWREG(GPIO_PORTB_BASE + GPIO_O_AFSEL) &= ~PORTB_LED_PINS;
+    HWREG(GPIO_PORTB_BASE + GPIO_O_AFSEL) |= AUDIO_PWM_PIN;
+    HWREG(GPIO_PORTB_BASE + GPIO_O_AMSEL) &= ~(PORTB_LED_PINS | AUDIO_PWM_PIN);
+    HWREG(GPIO_PORTB_BASE + GPIO_O_PCTL) =
+        (HWREG(GPIO_PORTB_BASE + GPIO_O_PCTL) & ~0x0F00000FU) |
+        GPIO_PCTL_PB6_M0PWM0_VALUE;
+    HWREG(GPIO_PORTB_BASE + GPIO_O_DIR) |= PORTB_LED_PINS;
+    HWREG(GPIO_PORTB_BASE + GPIO_O_DEN) |= (PORTB_LED_PINS | AUDIO_PWM_PIN);
+    SetPortBLedOutput(0U);
+
+    /*
+     * PWM generator 0 controls M0PWM0. The generator action drives the output
+     * high at LOAD and low at comparator A, producing a 50% duty square wave
+     * after AudioStart() loads a frequency.
+     */
+    HWREG(PWM0_BASE + PWM_O_0_CTL) = 0U;
+    HWREG(PWM0_BASE + PWM_O_0_GENA) =
+        PWM_0_GENA_ACTLOAD_ONE | PWM_0_GENA_ACTCMPAD_ZERO;
+    HWREG(PWM0_BASE + PWM_O_ENABLE) &= ~PWM_ENABLE_PWM0EN;
 }
 
 static void
@@ -221,6 +355,151 @@ SetLedOutput(uint8_t ui8Pins)
      * PF1/PF2/PF3 LED bits and leaves the switch input untouched.
      */
     HWREG(GPIO_PORTF_BASE + (GPIO_O_DATA + (RGB_LED_PINS << 2))) = ui8Pins;
+}
+
+static void
+SetPortBLedOutput(uint8_t ui8Pins)
+{
+    /*
+     * Mirror status onto the external Port B LED bank used in audio.c. PB0-PB3
+     * are normal GPIO outputs, so the low nibble can be written directly using
+     * a masked data alias without affecting PB6 PWM.
+     */
+    HWREG(GPIO_PORTB_BASE + (GPIO_O_DATA + (PORTB_LED_PINS << 2))) =
+        (ui8Pins & PORTB_LED_PINS);
+}
+
+static uint16_t
+MsToTicks(uint16_t ui16DurationMs)
+{
+    uint16_t ui16Ticks;
+
+    ui16Ticks = (uint16_t)(ui16DurationMs / SYSTICK_PERIOD_MS);
+    if(ui16Ticks == 0U)
+    {
+        ui16Ticks = 1U;
+    }
+
+    return ui16Ticks;
+}
+
+void
+SysTick_Handler(void)
+{
+    /*
+     * Keep the ISR short. It only records that one scheduler tick elapsed;
+     * the main loop handles debounce, FSM transitions, LED updates, and audio
+     * state changes outside interrupt context.
+     */
+    g_ui32SystemTicks++;
+    g_bSysTickElapsed = true;
+}
+
+static void
+SysTickInit(void)
+{
+    uint32_t ui32Reload;
+
+    ui32Reload = ((SYSTEM_CLOCK_HZ / 1000U) * SYSTICK_PERIOD_MS) - 1U;
+
+    /*
+     * SysTick has a 24-bit reload register. The 5 ms reload at 16 MHz is
+     * 79,999, so it is comfortably within range.
+     */
+    HWREG(NVIC_ST_CTRL) = 0U;
+    HWREG(NVIC_ST_RELOAD) = ui32Reload & NVIC_ST_RELOAD_M;
+    HWREG(NVIC_ST_CURRENT) = 0U;
+    HWREG(NVIC_ST_CTRL) =
+        NVIC_ST_CTRL_CLK_SRC | NVIC_ST_CTRL_INTEN | NVIC_ST_CTRL_ENABLE;
+}
+
+static uint8_t
+PhraseToLedColor(uint8_t ui8PhraseId)
+{
+    /*
+     * There are only three physical LED channels, so the six phrases use a
+     * repeatable color cycle.
+     */
+    switch(ui8PhraseId % 6U)
+    {
+        case 0U:
+            return LED_RED_PIN;
+
+        case 1U:
+            return LED_GREEN_PIN;
+
+        case 2U:
+            return LED_BLUE_PIN;
+
+        case 3U:
+            return LED_YELLOW_PINS;
+
+        case 4U:
+            return LED_CYAN_PINS;
+
+        default:
+            return LED_MAGENTA_PINS;
+    }
+}
+
+static uint8_t
+PhraseToPortBPattern(uint8_t ui8PhraseId)
+{
+    /*
+     * Reuse the external LED patterns that appeared in audio.c so the same
+     * wiring on PB0-PB3 still gives recognizable phrase-level feedback.
+     */
+    switch(ui8PhraseId)
+    {
+        case 0U:
+            return 0x05U;
+
+        case 1U:
+            return 0x0AU;
+
+        case 2U:
+            return 0x00U;
+
+        case 3U:
+            return 0x0FU;
+
+        case 4U:
+            return 0x05U;
+
+        default:
+            return 0x0AU;
+    }
+}
+
+static void
+AudioStop(void)
+{
+    HWREG(PWM0_BASE + PWM_O_ENABLE) &= ~PWM_ENABLE_PWM0EN;
+    HWREG(PWM0_BASE + PWM_O_0_CTL) &= ~PWM_0_CTL_ENABLE;
+}
+
+static void
+AudioStart(uint16_t ui16FrequencyHz)
+{
+    uint32_t ui32Load;
+
+    if(ui16FrequencyHz == NOTE_REST_HZ)
+    {
+        AudioStop();
+        return;
+    }
+
+    ui32Load = (PWM_CLOCK_HZ / (uint32_t)ui16FrequencyHz) - 1U;
+
+    /*
+     * The melody frequencies are low enough that the load values fit in the
+     * 16-bit PWM load register at the default 16 MHz clock.
+     */
+    HWREG(PWM0_BASE + PWM_O_0_CTL) &= ~PWM_0_CTL_ENABLE;
+    HWREG(PWM0_BASE + PWM_O_0_LOAD) = ui32Load;
+    HWREG(PWM0_BASE + PWM_O_0_CMPA) = ui32Load / 2U;
+    HWREG(PWM0_BASE + PWM_O_0_CTL) |= PWM_0_CTL_ENABLE;
+    HWREG(PWM0_BASE + PWM_O_ENABLE) |= PWM_ENABLE_PWM0EN;
 }
 
 static bool
@@ -239,50 +518,47 @@ IsActivePlaybackState(app_state_t eState)
 static void
 ApplyStateOutputs(const app_context_t *psContext)
 {
+    uint8_t ui8RgbOutput;
+    uint8_t ui8PortBOutput;
+
     /*
-     * State-to-LED mapping for board testing:
-     *   IDLE          = blue
-     *   LOAD_PHRASE   = yellow
-     *   LOAD_NOTE     = cyan
-     *   NOTE_ON       = green
-     *   NOTE_GAP      = white
-     *   PAUSED        = red
-     *   SONG_COMPLETE = magenta
+     * Milestone 3 uses phrase colors during the active playback region. This
+     * keeps the visible LED behavior tied to the song data instead of just the
+     * FSM state name.
      */
     switch(psContext->state)
     {
         case STATE_IDLE:
-            SetLedOutput(LED_BLUE_PIN);
+            ui8RgbOutput = LED_BLUE_PIN;
+            ui8PortBOutput = 0x01U;
             break;
 
         case STATE_LOAD_PHRASE:
-            SetLedOutput(LED_YELLOW_PINS);
-            break;
-
         case STATE_LOAD_NOTE:
-            SetLedOutput(LED_CYAN_PINS);
-            break;
-
         case STATE_NOTE_ON:
-            SetLedOutput(LED_GREEN_PIN);
-            break;
-
         case STATE_NOTE_GAP:
-            SetLedOutput(LED_WHITE_PINS);
+            ui8RgbOutput = PhraseToLedColor(psContext->phrase_index);
+            ui8PortBOutput = PhraseToPortBPattern(psContext->phrase_index);
             break;
 
         case STATE_PAUSED:
-            SetLedOutput(LED_RED_PIN);
+            ui8RgbOutput = LED_RED_PIN;
+            ui8PortBOutput = 0x08U;
             break;
 
         case STATE_SONG_COMPLETE:
-            SetLedOutput(LED_MAGENTA_PINS);
+            ui8RgbOutput = LED_MAGENTA_PINS;
+            ui8PortBOutput = 0x0FU;
             break;
 
         default:
-            SetLedOutput(0U);
+            ui8RgbOutput = 0U;
+            ui8PortBOutput = 0U;
             break;
     }
+
+    SetLedOutput(ui8RgbOutput);
+    SetPortBLedOutput(ui8PortBOutput);
 }
 
 static void
@@ -294,6 +570,34 @@ EnterState(app_context_t *psContext, app_state_t eNextState)
      */
     psContext->state = eNextState;
     psContext->state_ticks = 0U;
+
+    switch(eNextState)
+    {
+        case STATE_IDLE:
+        case STATE_LOAD_PHRASE:
+        case STATE_LOAD_NOTE:
+        case STATE_NOTE_GAP:
+        case STATE_PAUSED:
+        case STATE_SONG_COMPLETE:
+            AudioStop();
+            break;
+
+        case STATE_NOTE_ON:
+            if(psContext->song_index < TWINKLE_NOTE_COUNT)
+            {
+                AudioStart(g_twinkle_song[psContext->song_index].frequency_hz);
+            }
+            else
+            {
+                AudioStop();
+            }
+            break;
+
+        default:
+            AudioStop();
+            break;
+    }
+
     ApplyStateOutputs(psContext);
 }
 
@@ -301,7 +605,7 @@ static void
 ResetPlaybackPosition(app_context_t *psContext)
 {
     psContext->song_index = 0U;
-    psContext->phrase_index = 0U;
+    psContext->phrase_index = g_twinkle_song[0].phrase_id;
     psContext->resume_state = STATE_IDLE;
     psContext->resume_ticks = 0U;
 }
@@ -310,7 +614,7 @@ static void
 ApplyTransitionAction(app_context_t *psContext, app_event_t eEvent)
 {
     /*
-     * These actions update the simulated playback bookkeeping. They are kept
+     * These actions update the playback bookkeeping. They are kept
      * separate from the transition table so the table stays readable.
      */
     switch(eEvent)
@@ -325,15 +629,16 @@ ApplyTransitionAction(app_context_t *psContext, app_event_t eEvent)
 
         case EVT_GAP_DONE:
             psContext->song_index++;
+            psContext->phrase_index = g_twinkle_song[psContext->song_index].phrase_id;
             break;
 
         case EVT_PHRASE_DONE:
             psContext->song_index++;
-            psContext->phrase_index++;
+            psContext->phrase_index = g_twinkle_song[psContext->song_index].phrase_id;
             break;
 
         case EVT_SONG_DONE:
-            psContext->song_index = DEMO_TOTAL_NOTES;
+            psContext->song_index = TWINKLE_NOTE_COUNT;
             break;
 
         default:
@@ -371,6 +676,13 @@ HandleEvent(app_context_t *psContext, app_event_t eEvent)
     {
         psContext->state = psContext->resume_state;
         psContext->state_ticks = psContext->resume_ticks;
+        if(psContext->state == STATE_NOTE_ON)
+        {
+            if(psContext->song_index < TWINKLE_NOTE_COUNT)
+            {
+                AudioStart(g_twinkle_song[psContext->song_index].frequency_hz);
+            }
+        }
         ApplyStateOutputs(psContext);
         return;
     }
@@ -396,11 +708,11 @@ static app_event_t
 GenerateTimedEvent(app_context_t *psContext)
 {
     uint16_t ui16NextNote;
+    uint16_t ui16NoteTicks;
 
     /*
-     * The timer model is deliberately simple for Milestone 2. It creates
-     * artificial events after a state has been active for a fixed number of
-     * polling ticks. Real note durations will replace this in Milestone 3.
+     * The timing source is still a polling loop, but NOTE_ON now uses the real
+     * duration from the Twinkle song table.
      */
     if(!IsActivePlaybackState(psContext->state))
     {
@@ -426,7 +738,14 @@ GenerateTimedEvent(app_context_t *psContext)
             break;
 
         case STATE_NOTE_ON:
-            if(psContext->state_ticks >= NOTE_ON_TICKS)
+            if(psContext->song_index >= TWINKLE_NOTE_COUNT)
+            {
+                return EVT_SONG_DONE;
+            }
+
+            ui16NoteTicks =
+                MsToTicks(g_twinkle_song[psContext->song_index].duration_ms);
+            if(psContext->state_ticks >= ui16NoteTicks)
             {
                 return EVT_NOTE_DONE;
             }
@@ -437,12 +756,13 @@ GenerateTimedEvent(app_context_t *psContext)
             {
                 ui16NextNote = psContext->song_index + 1U;
 
-                if(ui16NextNote >= DEMO_TOTAL_NOTES)
+                if(ui16NextNote >= TWINKLE_NOTE_COUNT)
                 {
                     return EVT_SONG_DONE;
                 }
 
-                if((ui16NextNote % DEMO_NOTES_PER_PHRASE) == 0U)
+                if(g_twinkle_song[ui16NextNote].phrase_id !=
+                   psContext->phrase_index)
                 {
                     return EVT_PHRASE_DONE;
                 }
@@ -505,28 +825,13 @@ PollSwitchEvent(void)
     return EVT_NONE;
 }
 
-static void
-WaitForNextPoll(void)
-{
-    volatile uint32_t ui32DelayCount;
-
-    /*
-     * Temporary software delay for Milestone 2. Hardware timers should replace
-     * this before note playback is implemented.
-     */
-    ui32DelayCount = SYSTEM_CLOCK_HZ / (3U * (1000U / POLL_PERIOD_MS));
-    while(ui32DelayCount > 0U)
-    {
-        ui32DelayCount--;
-    }
-}
-
 int
 main(void)
 {
     app_context_t sAppContext;
 
     BoardInit();
+    SysTickInit();
 
     /*
      * Explicit initial state required by the FSM design.
@@ -542,11 +847,19 @@ main(void)
     while(1)
     {
         /*
-         * Prioritize user input so a button press can pause before an
-         * automatically generated timing event advances the FSM.
+         * SysTick provides the time base. The main loop does the actual work
+         * once per tick so the ISR stays small and predictable.
          */
-        HandleEvent(&sAppContext, PollSwitchEvent());
-        HandleEvent(&sAppContext, GenerateTimedEvent(&sAppContext));
-        WaitForNextPoll();
+        if(g_bSysTickElapsed)
+        {
+            g_bSysTickElapsed = false;
+
+            /*
+             * Prioritize user input so a button press can pause before an
+             * automatically generated timing event advances the FSM.
+             */
+            HandleEvent(&sAppContext, PollSwitchEvent());
+            HandleEvent(&sAppContext, GenerateTimedEvent(&sAppContext));
+        }
     }
 }
