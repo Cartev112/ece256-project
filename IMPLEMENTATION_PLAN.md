@@ -247,16 +247,18 @@ Use one of these approaches:
 
 Recommended baseline: `PWM tone generation`, because it is the fastest path to a recognizable song.
 
+Current implementation choice: `PB6 / M0PWM0` is the PWM audio output pin. It should feed a small speaker driver, powered buzzer input, or RC filter/amplifier. Do not connect a bare low-impedance speaker directly to the microcontroller pin.
+
 #### PWM plan
 
-- Configure a PWM-capable pin.
+- Configure `PB6` as `M0PWM0`.
 - For each note:
   - compute load value from target note frequency
   - set a 50% duty cycle
   - enable PWM while note is active
 - For rests:
   - disable PWM output or set duty cycle to zero
-- Use a periodic timer or SysTick to measure note duration in milliseconds
+- Use interrupt-driven SysTick to measure note duration in `5 ms` ticks
 
 This will not sound like a rich instrument, but it is enough for Milestone 3.
 
@@ -299,7 +301,7 @@ This keeps LED timing tied to music data, not hard-coded delays.
 
 Recommended method:
 
-- Poll every `5 ms` using `SysTick` or a periodic timer.
+- Sample every `5 ms` from the SysTick-driven scheduler.
 - Require `3` consecutive stable samples before accepting a state change.
 - Generate one event on the `released -> pressed` transition.
 
@@ -325,11 +327,19 @@ This is simple, deterministic, and enough for a single-button interface.
 
 - Use `UART0` on `PA0/PA1`
 - `115200-8-N-1`
-- Interrupt-driven RX is preferred but polling is acceptable at first
+- Current implementation: polling RX in the main loop, interrupt-driven SysTick for the scheduler tick
 
 ### Integration Rule
 
 UART must inject the same FSM events used by the button path. Do not create separate control logic for UART and `SW1`.
+
+### Current UART Command Set
+
+- `p` = play or resume
+- `a` = pause
+- `s` = stop and return to `IDLE`
+- `r` = restart from the first note
+- `h` or `?` = print help/status
 
 ## 11. DMA Integration Plan
 
@@ -411,6 +421,8 @@ DMA should handle high-rate repetitive sample movement. The CPU should only:
 - Third `SW1` press resumes from the paused note.
 - LED color changes only at phrase boundaries.
 - Song completes and enters the done/idle end state correctly.
+- `PB6 / M0PWM0` outputs the current note during `NOTE_ON`.
+- PWM output is disabled during `NOTE_GAP`, `PAUSED`, `IDLE`, and `SONG_COMPLETE`.
 
 ### Timing Tests
 
@@ -455,8 +467,8 @@ To keep the project achievable:
 
 ## 18. Immediate Next Steps
 
-1. Confirm the exact audio hardware path for Milestone 3: `PWM` or `R-2R DAC`.
-2. Enter the `Twinkle Twinkle` note table and phrase boundaries.
-3. Implement `IDLE`, `PLAYING`, `PAUSED`, and `SONG_DONE`.
-4. Replace delay-loop timing with timer-based timing.
-5. Demo button-controlled playback before adding UART and DMA.
+1. Test current `PB6 / M0PWM0` PWM output with the board and external audio circuit.
+2. Verify `Twinkle Twinkle` timing and phrase LED colors by ear and by observing the RGB LED.
+3. Tune SysTick-based note durations after board testing.
+4. Add UART state/status messages for Milestone 4.
+5. Prepare the audio backend for DMA-buffered output in Milestone 5.

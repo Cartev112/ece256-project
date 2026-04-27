@@ -17,6 +17,7 @@
 #include "inc/hw_pwm.h"
 #include "inc/hw_sysctl.h"
 #include "inc/hw_types.h"
+#include "inc/hw_uart.h"
 
 /*
  * The TM4C LaunchPad comes out of reset using the internal 16 MHz system
@@ -64,6 +65,11 @@
 
 #define QUARTER_NOTE_MS             400U
 #define HALF_NOTE_MS                800U
+
+#define UART_BAUD_RATE              115200U
+#define UART0_RXTX_PINS             0x03U
+#define GPIO_PCTL_PA0_U0RX_VALUE    0x00000001U
+#define GPIO_PCTL_PA1_U0TX_VALUE    0x00000010U
 
 static volatile bool g_bSysTickElapsed = false;
 static volatile uint32_t g_ui32SystemTicks = 0U;
@@ -134,6 +140,10 @@ typedef enum
 {
     EVT_NONE = 0,
     EVT_SW1_PRESS,
+    EVT_UART_PLAY,
+    EVT_UART_PAUSE,
+    EVT_UART_STOP,
+    EVT_UART_RESTART,
     EVT_PHRASE_READY,
     EVT_NOTE_READY,
     EVT_NOTE_DONE,
@@ -281,18 +291,28 @@ static const fsm_transition_t g_fsm_transitions[] =
 
 static void AudioStop(void);
 static void SetPortBLedOutput(uint8_t ui8Pins);
+static void UartInit(void);
+static void UartWriteChar(char cChar);
+static void UartWriteString(const char *pcString);
+static void UartWriteUInt(uint32_t ui32Value);
+static bool UartReadChar(char *pcChar);
+static void UartWriteStatus(const app_context_t *psContext, const char *pcPrefix);
+static void HandleUartCommand(app_context_t *psContext, char cCommand);
+static void HandleEvent(app_context_t *psContext, app_event_t eEvent);
 
 static void
 BoardInit(void)
 {
     /*
-     * Enable Port F for the onboard RGB LED and SW1. Enable Port B and PWM0
-     * for PB0-PB3 LED output and PB6/M0PWM0 audio output.
+     * Enable Port A for UART0 pins, Port F for the onboard RGB LED and SW1,
+     * and Port B plus PWM0 for PB0-PB3 LED output and PB6/M0PWM0 audio.
      */
-    HWREG(SYSCTL_RCGCGPIO) |= (SYSCTL_RCGCGPIO_R5 | SYSCTL_RCGCGPIO_R1);
+    HWREG(SYSCTL_RCGCGPIO) |=
+        (SYSCTL_RCGCGPIO_R5 | SYSCTL_RCGCGPIO_R1 | SYSCTL_RCGCGPIO_R0);
     HWREG(SYSCTL_RCGCPWM) |= SYSCTL_RCGCPWM_R0;
-    while((HWREG(SYSCTL_PRGPIO) & (SYSCTL_PRGPIO_R5 | SYSCTL_PRGPIO_R1)) !=
-          (SYSCTL_PRGPIO_R5 | SYSCTL_PRGPIO_R1))
+    while((HWREG(SYSCTL_PRGPIO) &
+           (SYSCTL_PRGPIO_R5 | SYSCTL_PRGPIO_R1 | SYSCTL_PRGPIO_R0)) !=
+          (SYSCTL_PRGPIO_R5 | SYSCTL_PRGPIO_R1 | SYSCTL_PRGPIO_R0))
     {
     }
     while((HWREG(SYSCTL_PRPWM) & SYSCTL_PRPWM_R0) == 0U)
@@ -413,6 +433,150 @@ SysTickInit(void)
         NVIC_ST_CTRL_CLK_SRC | NVIC_ST_CTRL_INTEN | NVIC_ST_CTRL_ENABLE;
 }
 
+static void
+UartInit(void)
+{
+    /*
+     * UART0 uses PA0/PA1. With a 16 MHz system clock and 115200 baud:
+     *
+     * BRD = 16,000,000 / (16 * 115200) = 8.6805
+     * IBRD = 8
+     * FBRD = round(0.6805 * 64) = 44
+     */
+    HWREG(SYSCTL_RCGCUART) |= SYSCTL_RCGCUART_R0;
+    while((HWREG(SYSCTL_PRUART) & SYSCTL_PRUART_R0) == 0U)
+    {
+    }
+
+    HWREG(GPIO_PORTA_BASE + GPIO_O_AFSEL) |= UART0_RXTX_PINS;
+    HWREG(GPIO_PORTA_BASE + GPIO_O_AMSEL) &= ~UART0_RXTX_PINS;
+    HWREG(GPIO_PORTA_BASE + GPIO_O_PCTL) =
+        (HWREG(GPIO_PORTA_BASE + GPIO_O_PCTL) & ~0x000000FFU) |
+        GPIO_PCTL_PA0_U0RX_VALUE | GPIO_PCTL_PA1_U0TX_VALUE;
+    HWREG(GPIO_PORTA_BASE + GPIO_O_DEN) |= UART0_RXTX_PINS;
+
+    HWREG(UART0_BASE + UART_O_CTL) = 0U;
+    HWREG(UART0_BASE + UART_O_IBRD) = 8U;
+    HWREG(UART0_BASE + UART_O_FBRD) = 44U;
+    HWREG(UART0_BASE + UART_O_LCRH) = UART_LCRH_WLEN_8 | UART_LCRH_FEN;
+    HWREG(UART0_BASE + UART_O_CTL) =
+        UART_CTL_UARTEN | UART_CTL_TXE | UART_CTL_RXE;
+}
+
+static void
+UartWriteChar(char cChar)
+{
+    while((HWREG(UART0_BASE + UART_O_FR) & UART_FR_TXFF) != 0U)
+    {
+    }
+
+    HWREG(UART0_BASE + UART_O_DR) = (uint32_t)cChar;
+}
+
+static void
+UartWriteString(const char *pcString)
+{
+    while(*pcString != '\0')
+    {
+        if(*pcString == '\n')
+        {
+            UartWriteChar('\r');
+        }
+
+        UartWriteChar(*pcString);
+        pcString++;
+    }
+}
+
+static void
+UartWriteUInt(uint32_t ui32Value)
+{
+    char acDigits[10];
+    uint32_t ui32Index;
+
+    if(ui32Value == 0U)
+    {
+        UartWriteChar('0');
+        return;
+    }
+
+    ui32Index = 0U;
+    while(ui32Value > 0U)
+    {
+        acDigits[ui32Index] = (char)('0' + (ui32Value % 10U));
+        ui32Value /= 10U;
+        ui32Index++;
+    }
+
+    while(ui32Index > 0U)
+    {
+        ui32Index--;
+        UartWriteChar(acDigits[ui32Index]);
+    }
+}
+
+static bool
+UartReadChar(char *pcChar)
+{
+    if((HWREG(UART0_BASE + UART_O_FR) & UART_FR_RXFE) != 0U)
+    {
+        return false;
+    }
+
+    *pcChar = (char)(HWREG(UART0_BASE + UART_O_DR) & UART_DR_DATA_M);
+    return true;
+}
+
+static void
+UartWriteStatus(const app_context_t *psContext, const char *pcPrefix)
+{
+    UartWriteString(pcPrefix);
+    UartWriteString(": tick=");
+    UartWriteUInt(g_ui32SystemTicks);
+    UartWriteString(" state=");
+
+    switch(psContext->state)
+    {
+        case STATE_IDLE:
+            UartWriteString("IDLE");
+            break;
+
+        case STATE_LOAD_PHRASE:
+            UartWriteString("LOAD_PHRASE");
+            break;
+
+        case STATE_LOAD_NOTE:
+            UartWriteString("LOAD_NOTE");
+            break;
+
+        case STATE_NOTE_ON:
+            UartWriteString("NOTE_ON");
+            break;
+
+        case STATE_NOTE_GAP:
+            UartWriteString("NOTE_GAP");
+            break;
+
+        case STATE_PAUSED:
+            UartWriteString("PAUSED");
+            break;
+
+        case STATE_SONG_COMPLETE:
+            UartWriteString("SONG_COMPLETE");
+            break;
+
+        default:
+            UartWriteString("UNKNOWN");
+            break;
+    }
+
+    UartWriteString(" note=");
+    UartWriteUInt(psContext->song_index);
+    UartWriteString(" phrase=");
+    UartWriteUInt(psContext->phrase_index);
+    UartWriteChar('\n');
+}
+
 static uint8_t
 PhraseToLedColor(uint8_t ui8PhraseId)
 {
@@ -468,6 +632,50 @@ PhraseToPortBPattern(uint8_t ui8PhraseId)
 
         default:
             return 0x0AU;
+    }
+}
+
+static void
+HandleUartCommand(app_context_t *psContext, char cCommand)
+{
+    if((cCommand >= 'A') && (cCommand <= 'Z'))
+    {
+        cCommand = (char)(cCommand - 'A' + 'a');
+    }
+
+    switch(cCommand)
+    {
+        case 'p':
+            HandleEvent(psContext, EVT_UART_PLAY);
+            break;
+
+        case 'a':
+            HandleEvent(psContext, EVT_UART_PAUSE);
+            break;
+
+        case 's':
+            HandleEvent(psContext, EVT_UART_STOP);
+            break;
+
+        case 'r':
+            HandleEvent(psContext, EVT_UART_RESTART);
+            break;
+
+        case 'h':
+        case '?':
+            UartWriteString("Commands: p=play/resume a=pause s=stop r=restart h=?=help\n");
+            UartWriteStatus(psContext, "STATUS");
+            break;
+
+        case '\r':
+        case '\n':
+            break;
+
+        default:
+            UartWriteString("Unknown command: ");
+            UartWriteChar(cCommand);
+            UartWriteChar('\n');
+            break;
     }
 }
 
@@ -599,6 +807,7 @@ EnterState(app_context_t *psContext, app_state_t eNextState)
     }
 
     ApplyStateOutputs(psContext);
+    UartWriteStatus(psContext, "STATE");
 }
 
 static void
@@ -657,6 +866,44 @@ HandleEvent(app_context_t *psContext, app_event_t eEvent)
     }
 
     /*
+     * UART play/resume follows the same user-visible behavior as SW1 without
+     * introducing a second control path for the common transitions.
+     */
+    if(eEvent == EVT_UART_PLAY)
+    {
+        if((psContext->state == STATE_IDLE) ||
+           (psContext->state == STATE_PAUSED) ||
+           (psContext->state == STATE_SONG_COMPLETE))
+        {
+            HandleEvent(psContext, EVT_SW1_PRESS);
+        }
+        return;
+    }
+
+    if(eEvent == EVT_UART_PAUSE)
+    {
+        if(IsActivePlaybackState(psContext->state))
+        {
+            HandleEvent(psContext, EVT_SW1_PRESS);
+        }
+        return;
+    }
+
+    if(eEvent == EVT_UART_STOP)
+    {
+        ResetPlaybackPosition(psContext);
+        EnterState(psContext, STATE_IDLE);
+        return;
+    }
+
+    if(eEvent == EVT_UART_RESTART)
+    {
+        ResetPlaybackPosition(psContext);
+        EnterState(psContext, STATE_LOAD_PHRASE);
+        return;
+    }
+
+    /*
      * SW1 is a control event that can interrupt any active playback sub-state.
      * The FSM saves both the current state and the elapsed state time before
      * entering PAUSED.
@@ -684,6 +931,7 @@ HandleEvent(app_context_t *psContext, app_event_t eEvent)
             }
         }
         ApplyStateOutputs(psContext);
+        UartWriteStatus(psContext, "STATE");
         return;
     }
 
@@ -829,8 +1077,10 @@ int
 main(void)
 {
     app_context_t sAppContext;
+    char cRxChar;
 
     BoardInit();
+    UartInit();
     SysTickInit();
 
     /*
@@ -843,9 +1093,17 @@ main(void)
     sAppContext.state_ticks = 0U;
     sAppContext.resume_ticks = 0U;
     ApplyStateOutputs(&sAppContext);
+    UartWriteString("UART0 ready at 115200 8-N-1\n");
+    UartWriteString("Commands: p=play/resume a=pause s=stop r=restart h=?=help\n");
+    UartWriteStatus(&sAppContext, "STATE");
 
     while(1)
     {
+        while(UartReadChar(&cRxChar))
+        {
+            HandleUartCommand(&sAppContext, cRxChar);
+        }
+
         /*
          * SysTick provides the time base. The main loop does the actual work
          * once per tick so the ISR stays small and predictable.
