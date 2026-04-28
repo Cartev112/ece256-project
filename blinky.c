@@ -66,6 +66,14 @@
 #define QUARTER_NOTE_MS             400U
 #define HALF_NOTE_MS                800U
 
+/*
+ * UART0 uses the standard LaunchPad serial pins:
+ *   PA0 = U0RX
+ *   PA1 = U0TX
+ *
+ * The baud rate is fixed at 115200 so the board can be observed easily from a
+ * serial terminal while Milestone 4 is being debugged.
+ */
 #define UART_BAUD_RATE              115200U
 #define UART0_RXTX_PINS             0x03U
 #define GPIO_PCTL_PA0_U0RX_VALUE    0x00000001U
@@ -448,6 +456,13 @@ UartInit(void)
     {
     }
 
+    /*
+     * Give PA0 and PA1 to the UART peripheral:
+     *   - AFSEL enables alternate function mode
+     *   - AMSEL is cleared because UART is digital only
+     *   - PCTL selects the U0RX/U0TX mux function
+     *   - DEN turns the pins on as digital pads
+     */
     HWREG(GPIO_PORTA_BASE + GPIO_O_AFSEL) |= UART0_RXTX_PINS;
     HWREG(GPIO_PORTA_BASE + GPIO_O_AMSEL) &= ~UART0_RXTX_PINS;
     HWREG(GPIO_PORTA_BASE + GPIO_O_PCTL) =
@@ -455,6 +470,10 @@ UartInit(void)
         GPIO_PCTL_PA0_U0RX_VALUE | GPIO_PCTL_PA1_U0TX_VALUE;
     HWREG(GPIO_PORTA_BASE + GPIO_O_DEN) |= UART0_RXTX_PINS;
 
+    /*
+     * Disable UART0 while loading the baud-rate and frame-format registers.
+     * The final control write enables the block, transmitter, and receiver.
+     */
     HWREG(UART0_BASE + UART_O_CTL) = 0U;
     HWREG(UART0_BASE + UART_O_IBRD) = 8U;
     HWREG(UART0_BASE + UART_O_FBRD) = 44U;
@@ -466,6 +485,11 @@ UartInit(void)
 static void
 UartWriteChar(char cChar)
 {
+    /*
+     * Wait until there is space in the transmit FIFO, then push one byte.
+     * This is a blocking transmit path, which is acceptable for debug/status
+     * output at this project scale.
+     */
     while((HWREG(UART0_BASE + UART_O_FR) & UART_FR_TXFF) != 0U)
     {
     }
@@ -476,6 +500,9 @@ UartWriteChar(char cChar)
 static void
 UartWriteString(const char *pcString)
 {
+    /*
+     * Convert newline to CRLF so terminals display line breaks cleanly.
+     */
     while(*pcString != '\0')
     {
         if(*pcString == '\n')
@@ -494,6 +521,10 @@ UartWriteUInt(uint32_t ui32Value)
     char acDigits[10];
     uint32_t ui32Index;
 
+    /*
+     * Tiny decimal conversion helper used by the status logger. Avoiding
+     * sprintf() keeps the code small and predictable for bare-metal builds.
+     */
     if(ui32Value == 0U)
     {
         UartWriteChar('0');
@@ -518,6 +549,10 @@ UartWriteUInt(uint32_t ui32Value)
 static bool
 UartReadChar(char *pcChar)
 {
+    /*
+     * Polling RX is enough for Milestone 4. The function returns false when
+     * the receive FIFO is empty so the main loop can move on immediately.
+     */
     if((HWREG(UART0_BASE + UART_O_FR) & UART_FR_RXFE) != 0U)
     {
         return false;
@@ -530,6 +565,11 @@ UartReadChar(char *pcChar)
 static void
 UartWriteStatus(const app_context_t *psContext, const char *pcPrefix)
 {
+    /*
+     * Print a compact machine-state snapshot. This makes it easy to see
+     * whether button events, UART commands, and timing events are moving the
+     * FSM the way we expect.
+     */
     UartWriteString(pcPrefix);
     UartWriteString(": tick=");
     UartWriteUInt(g_ui32SystemTicks);
@@ -638,11 +678,26 @@ PhraseToPortBPattern(uint8_t ui8PhraseId)
 static void
 HandleUartCommand(app_context_t *psContext, char cCommand)
 {
+    /*
+     * Accept uppercase or lowercase commands so the terminal interaction is a
+     * little more forgiving during bring-up.
+     */
     if((cCommand >= 'A') && (cCommand <= 'Z'))
     {
         cCommand = (char)(cCommand - 'A' + 'a');
     }
 
+    /*
+     * Single-character command map:
+     *   p = play or resume
+     *   a = pause
+     *   s = stop and return to IDLE
+     *   r = restart from the first note
+     *   h/? = help
+     *
+     * The command handler does not directly manipulate LEDs or audio. It hands
+     * control to the same FSM paths used elsewhere so behavior stays consistent.
+     */
     switch(cCommand)
     {
         case 'p':
@@ -860,6 +915,12 @@ HandleEvent(app_context_t *psContext, app_event_t eEvent)
 {
     uint32_t ui32Index;
 
+    /*
+     * Most of the FSM is table-driven, but UART control events are treated as
+     * a thin control layer that maps terminal commands onto the existing
+     * playback behavior. This keeps UART from creating a second independent
+     * state machine.
+     */
     if(eEvent == EVT_NONE)
     {
         return;
@@ -891,6 +952,10 @@ HandleEvent(app_context_t *psContext, app_event_t eEvent)
 
     if(eEvent == EVT_UART_STOP)
     {
+        /*
+         * Stop is intentionally stronger than pause. It resets playback
+         * bookkeeping and returns the machine to the defined initial state.
+         */
         ResetPlaybackPosition(psContext);
         EnterState(psContext, STATE_IDLE);
         return;
@@ -898,6 +963,10 @@ HandleEvent(app_context_t *psContext, app_event_t eEvent)
 
     if(eEvent == EVT_UART_RESTART)
     {
+        /*
+         * Restart discards the current playback position and jumps directly to
+         * the normal phrase-loading start path.
+         */
         ResetPlaybackPosition(psContext);
         EnterState(psContext, STATE_LOAD_PHRASE);
         return;
