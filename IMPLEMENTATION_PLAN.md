@@ -61,7 +61,7 @@ The design should leave room to integrate `UART` in Milestone 4 and `uDMA` in Mi
 
 Split the project into small modules even if they initially live in one file.
 
-- `main.c` or `blinky.c`
+- `blinky.c`
   - system startup
   - scheduler loop
   - top-level FSM dispatch
@@ -74,7 +74,7 @@ Split the project into small modules even if they initially live in one file.
   - song table
   - phrase markers
   - playback timing
-- `audio.[ch]`
+- `player_audio.[ch]`
   - PWM or DAC setup
   - note-to-frequency handling
   - sample/tone generation
@@ -82,16 +82,26 @@ Split the project into small modules even if they initially live in one file.
   - RGB initialization
   - phrase-based color updates
 - `button.[ch]`
-  - `SW1` debounce
-  - edge detection
-- `uart.[ch]` for Milestone 4
+  - `SW1` GPIO interrupt setup
+  - SysTick-confirmed debounce
+  - press event generation
+- `uart.[ch]`
   - UART0 init
-  - transmit/receive helpers
+  - blocking transmit helpers
+  - interrupt-driven RX ring buffer
+- `commands.[ch]`
+  - UART command decoding
+  - command-to-FSM event mapping
+- `systick.[ch]`
+  - 5 ms scheduler tick
+  - SysTick interrupt handler
+- `board.[ch]` / `board_pins.h`
+  - GPIO, PWM, and pin mux initialization
 - `dma.[ch]` for Milestone 5
   - `uDMA` channel config
   - ping-pong or circular buffer support
 
-For the current small repo, it is acceptable to reach Milestone 3 in one source file first, then split into modules once the behavior is stable.
+The current repo is now split into these modules. The older teammate prototype `audio.c` remains standalone and is excluded from the managed project build because it has its own `main()`.
 
 ## 5. FSM Design
 
@@ -301,11 +311,13 @@ This keeps LED timing tied to music data, not hard-coded delays.
 
 Recommended method:
 
-- Sample every `5 ms` from the SysTick-driven scheduler.
-- Require `3` consecutive stable samples before accepting a state change.
-- Generate one event on the `released -> pressed` transition.
+- Use a falling-edge GPIO interrupt on `PF4` to detect the raw press edge.
+- Mask the GPIO interrupt while the press is being debounced.
+- Confirm the press with `3` consecutive stable samples from the `5 ms` SysTick-driven scheduler.
+- Generate one FSM event after the stable press is confirmed.
+- Wait for a stable release before re-enabling the GPIO interrupt.
 
-This is simple, deterministic, and enough for a single-button interface.
+This keeps the button interrupt short while still handling mechanical bounce deterministically.
 
 ## 10. UART Integration Plan
 
@@ -327,7 +339,7 @@ This is simple, deterministic, and enough for a single-button interface.
 
 - Use `UART0` on `PA0/PA1`
 - `115200-8-N-1`
-- Current implementation: polling RX in the main loop, interrupt-driven SysTick for the scheduler tick
+- Current implementation: interrupt-driven UART RX with a small software ring buffer, blocking UART TX for short status messages, and interrupt-driven SysTick for the scheduler tick
 
 ### Integration Rule
 
