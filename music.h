@@ -10,6 +10,10 @@
 #define NOTE_F4_HZ                  349U
 #define NOTE_G4_HZ                  392U
 #define NOTE_A4_HZ                  440U
+#define NOTE_B4_HZ                  494U
+#define NOTE_Fs_HZ                  370U
+#define NOTE_Bb_HZ                  466U
+#define NOTE_Eb_HZ                  311U
 
 typedef struct
 {

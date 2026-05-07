@@ -66,6 +66,20 @@ PhraseToPortBPattern(uint8_t ui8PhraseId)
             return 0x0FU;
         case 4U:
             return 0x05U;
+        case 5U:
+            return 0x0AU;
+        case 6U:
+            return 0x05U;
+        case 7U:
+            return 0x0AU;
+        case 8U:
+            return 0x05U;
+        case 9U:
+            return 0x0AU;
+        case 10U:
+            return 0x00U;
+        case 11U:
+            return 0x0FU;
         default:
             return 0x0AU;
     }
