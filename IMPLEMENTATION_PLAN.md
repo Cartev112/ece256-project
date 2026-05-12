@@ -274,14 +274,15 @@ This will not sound like a rich instrument, but it is enough for Milestone 3.
 
 ### Milestone 5 Audio Path With DMA
 
-If DMA is required as a true integration milestone, move from note-level square-wave updates to sample-buffer streaming:
+Current implementation: audio has been moved from note-level PWM frequency changes to timer-triggered `uDMA` sample streaming.
 
-- Precompute a short waveform table or fill buffers on the fly.
-- Use a timer-triggered peripheral request.
-- Feed PWM compare updates or GPIO DAC samples through `uDMA`.
-- Use half-buffer/full-buffer interrupts to refill the next audio block.
+- `PB6 / M0PWM0` is configured as a fixed high-frequency PWM carrier.
+- `Timer0A` runs at an `8000 Hz` audio sample rate.
+- `uDMA` channel `18` moves the next sample into `PWM0 CMPA`.
+- Primary and alternate buffers are used in ping-pong mode.
+- The Timer0A ISR refills whichever buffer just completed.
 
-That gives a clearer reason for DMA than simply changing PWM frequency once per note.
+This gives a real DMA workload: the CPU still chooses notes through the FSM, but DMA handles repetitive high-rate sample output.
 
 ## 8. LED Synchronization Plan
 
@@ -352,6 +353,7 @@ UART must inject the same FSM events used by the button path. Do not create sepa
 - `s` = stop and return to `IDLE`
 - `r` = restart from the first note
 - `h` or `?` = print help/status
+- `d` = print DMA counters
 
 ## 11. DMA Integration Plan
 
@@ -363,7 +365,7 @@ UART must inject the same FSM events used by the button path. Do not create sepa
 
 ### Recommended DMA Direction
 
-Use timer-triggered `uDMA` to update the PWM duty cycle on the existing `PB6 / M0PWM0` audio output.
+Use timer-triggered `uDMA` to update the PWM duty cycle on the existing `PB6 / M0PWM0` audio output. This is now the implemented audio backend.
 
 Recommended signal path:
 
@@ -390,16 +392,17 @@ The current Milestone 3 audio changes the PWM period once per note. That is not 
 For Milestone 5, make DMA move many samples per second. Instead of changing PWM frequency directly, configure PWM as a fixed high-frequency carrier and use DMA to update the duty cycle:
 
 - PWM carrier: approximately `50 kHz` to `80 kHz`
-- Audio sample rate: start with `8 kHz`
+- Current PWM carrier: approximately `62.5 kHz`
+- Current audio sample rate: `8 kHz`
 - Sample values: unsigned duty values, for example `0..255` if PWM load is `255`
-- Buffer type: `uint16_t` is simplest for writing the PWM compare register
+- Current buffer type: `uint32_t`, because the DMA writes the 32-bit `PWM0 CMPA` register
 - Destination: `PWM0_BASE + PWM_O_0_CMPA`
 
 This makes DMA responsible for repetitive high-rate audio output while the CPU only refills buffers and handles the FSM.
 
-### New Files To Add
+### Current DMA Files
 
-Add these files rather than expanding `blinky.c` again:
+The DMA implementation lives in these files rather than being folded back into `blinky.c`:
 
 - `dma.h`
   - public DMA audio API
@@ -410,8 +413,14 @@ Add these files rather than expanding `blinky.c` again:
   - Timer0A sample-rate setup
   - uDMA channel setup
   - DMA/timer interrupt handlers
+- `player_audio.c`
+  - keeps the old `AudioStart()` / `AudioStop()` API stable
+  - calls `DmaAudioStartNote()` and `DmaAudioStop()` internally
+- `startup_ccs.c`
+  - maps the Timer0A vector to `Timer0A_Handler`
+  - maps the uDMA error vector to `uDMAError_Handler`
 
-Recommended public API:
+Current public API:
 
 ```c
 void DmaAudioInit(void);
@@ -422,14 +431,14 @@ void DmaAudioResume(void);
 void DmaAudioGetStatus(dma_audio_status_t *status);
 ```
 
-Keep the existing `player_audio.h` API stable if possible:
+The existing `player_audio.h` API is intentionally still stable:
 
 ```c
 void AudioStart(uint16_t frequency_hz);
 void AudioStop(void);
 ```
 
-Then `player_audio.c` can call `DmaAudioStartNote()` and `DmaAudioStop()` internally. That prevents the FSM from needing a rewrite.
+That prevents the FSM from needing a rewrite. The FSM still calls `AudioStart()` and `AudioStop()` exactly as before.
 
 ### DMA Resource Choices
 
@@ -440,7 +449,7 @@ Use these initial choices unless there is a specific conflict:
 - Timer event: Timer A timeout DMA event
 - Audio output: `PB6 / M0PWM0`
 - DMA mode: ping-pong
-- Buffers: two static buffers, for example `uint16_t primary[128]` and `uint16_t alternate[128]`
+- Buffers: two static `uint32_t[128]` buffers
 - Sample rate: `8000 Hz`
 - Buffer duration: `128 / 8000 = 16 ms` per buffer
 - Interrupt handlers to add in `startup_ccs.c`:
@@ -453,26 +462,28 @@ Keep every DMA buffer `static` or global. Do not allocate DMA buffers on the sta
 
 The uDMA control table must be aligned to a `1024-byte` boundary.
 
-For CCS/TI compiler style, use:
+For CCS/TI compiler style, the current code uses:
 
 ```c
-#pragma DATA_ALIGN(g_dma_control_table, 1024)
-static uint8_t g_dma_control_table[1024];
+#pragma DATA_ALIGN(g_sDmaControlTable, 1024)
+static dma_control_entry_t g_sDmaControlTable[64];
 ```
 
-If the project is built with a clang/GCC-style compiler, use an aligned attribute instead. Verify the map file or debugger address: the control table address must end in `0x000`, `0x400`, `0x800`, or `0xC00`.
+If the project is built with a clang/GCC-style compiler, the code uses an aligned attribute instead. Verify the map file or debugger address: the control table address must end in `0x000`, `0x400`, `0x800`, or `0xC00`.
+
+Current build verification: `g_sDmaControlTable` appears in the map at `0x20000000`, which is correctly aligned.
 
 ### Buffer Fill Strategy
 
-For the first working version, use a simple waveform:
+The first working version uses a simple square-wave duty pattern:
 
 - maintain a phase accumulator per note
 - for each sample:
-  - advance phase by `frequency_hz / sample_rate`
-  - generate a square, triangle, or sine-like duty value
-  - clamp the result to the valid PWM compare range
+  - advance a fixed-point phase accumulator
+  - output a low or high compare value around the PWM midpoint
+  - write the compare value into the DMA buffer
 
-Start with a square or triangle wave. A sine table sounds better but is not required for proving DMA. Prefer fixed-point integer math for the phase accumulator; avoid floating point inside the ISR.
+A sine table would sound better, but the square-wave buffer is enough to prove that DMA is moving audio-rate samples. Keep fixed-point integer math in the ISR; avoid floating point inside interrupt handlers.
 
 Example buffer-fill behavior:
 
@@ -484,7 +495,7 @@ fill_audio_buffer(buffer, count, note_frequency)
         buffer[i] = duty sample for PWM CMPA
 ```
 
-When the note is a rest (`frequency_hz == 0`), fill the buffer with a silent midpoint or zero-duty value, depending on the output circuit.
+When the note is a rest (`frequency_hz == 0`), the code stops DMA audio and mutes PWM instead of streaming a rest buffer.
 
 ### Ping-Pong Flow
 
@@ -570,9 +581,9 @@ Do not spend hours debugging audio logic if the first problem is actually a tool
 
 ### Useful Debug Counters
 
-Add a small status struct and print it from UART when the user sends `h` or a new command such as `d`.
+The DMA implementation exposes a status struct and prints it from UART when the user sends `d`, `h`, or `?`.
 
-Recommended counters:
+Current counters:
 
 - `primary_done_count`
 - `alternate_done_count`
@@ -580,8 +591,8 @@ Recommended counters:
 - `timer_dma_irq_count`
 - `buffer_refill_count`
 - `underrun_count`
-- `last_dma_mode_primary`
-- `last_dma_mode_alternate`
+- `bad_isr_count`
+- `active_frequency_hz`
 
 Expected healthy behavior:
 
@@ -590,6 +601,7 @@ Expected healthy behavior:
 - error count stays `0`
 - underrun count stays `0`
 - status prints still work while audio plays
+- `active_frequency_hz` is nonzero during a note and zero when stopped
 
 ### Why This Matters
 
@@ -691,36 +703,35 @@ DMA should handle high-rate repetitive sample movement. The CPU should only:
 Run these in order. Do not skip directly to full-song playback.
 
 1. Build-only test:
-   - add `dma.[ch]` stubs
-   - include them in the project
-   - verify the project still builds and links
+   - verify `dma.c` and `dma.h` are included in the project
+   - build the project
+   - expected result: compile and link complete without warnings
 
 2. uDMA control-table test:
-   - inspect `g_dma_control_table` in the debugger
+   - inspect `g_sDmaControlTable` in the debugger or map file
    - verify the address is `1024-byte` aligned
-   - confirm `dma_error_count == 0`
+   - expected result: current map shows `0x20000000`
 
 3. Timer sample-rate test:
-   - configure Timer0A for `8000 Hz`
-   - temporarily count Timer0A events for one second
-   - expected count: about `8000`
-   - with a scope, a debug pin toggled every event should show the expected period
+   - flash the board
+   - open UART at `115200-8-N-1`
+   - send `p` to start playback
+   - send `d` while a note is playing
+   - expected result: `irq`, `refill`, `primary`, and `alternate` increase
 
 4. Basic DMA movement test:
-   - transfer a known test pattern from one memory buffer to another
-   - compare every byte/word after completion
-   - expected result: destination exactly matches source
+   - send `d` before playback starts
+   - expected result: counters are stable and `freq=0`
+   - send `p`
+   - expected result: `freq` becomes the current note frequency
 
 5. Ping-pong test:
-   - configure primary and alternate buffers
-   - stream a repeating dummy pattern
    - print `primary_done_count` and `alternate_done_count`
    - expected result: both counters increase and stay close
 
 6. PWM destination test:
-   - stream a constant duty value to `PWM0 CMPA`
-   - verify PB6 stays at the expected duty cycle
-   - then stream a ramp or alternating duty pattern and verify duty changes
+   - probe `PB6` with a scope or logic analyzer while playback is active
+   - expected result: a fixed PWM carrier is visible, with compare updates changing the duty pattern at the audio sample rate
 
 7. Audio integration test:
    - press `SW1` or send UART `p`
@@ -733,6 +744,7 @@ Run these in order. Do not skip directly to full-song playback.
    - verify Timer0A/DMA stop and PB6 is muted
    - resume and verify the current note restarts cleanly
    - stop/restart and verify counters do not wedge
+   - expected result: `freq=0` while paused/stopped, then nonzero again after resume/play
 
 9. Stress test:
    - let the song loop or restart repeatedly for at least one minute
@@ -777,8 +789,8 @@ To keep the project achievable:
 
 ## 18. Immediate Next Steps
 
-1. Test current `PB6 / M0PWM0` PWM output with the board and external audio circuit.
-2. Verify `Twinkle Twinkle` timing and phrase LED colors by ear and by observing the RGB LED.
-3. Tune SysTick-based note durations after board testing.
-4. Add `dma.[ch]` stubs and confirm the split project still builds.
-5. Implement the uDMA control table, Timer0A sample clock, and a non-audio DMA proof test before touching the song playback path.
+1. Flash the current firmware to the TM4C board.
+2. Open UART0 at `115200-8-N-1` and confirm the startup banner appears.
+3. Send `d` before playback and confirm DMA counters are stable with `freq=0`.
+4. Send `p` or press `SW1`; confirm music starts, phrase LEDs still change, and `d` shows increasing DMA counters.
+5. Probe `PB6 / M0PWM0` if audio is unclear; verify the PWM carrier exists before debugging the speaker/amplifier circuit.

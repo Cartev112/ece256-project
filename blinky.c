@@ -8,6 +8,7 @@
 #include "board.h"
 #include "button.h"
 #include "commands.h"
+#include "dma.h"
 #include "fsm.h"
 #include "systick.h"
 #include "uart.h"
@@ -20,12 +21,13 @@ main(void)
 
     BoardInit();
     ButtonInit();
+    DmaAudioInit();
     UartInit();
     SysTickInit();
     FsmInit(&sAppContext);
 
     UartWriteString("UART0 ready at 115200 8-N-1, RX interrupt enabled\n");
-    UartWriteString("Commands: p=play/resume a=pause s=stop r=restart h=?=help\n");
+    UartWriteString("Commands: p=play/resume a=pause s=stop r=restart d=dma h=?=help\n");
     UartWriteStatus(&sAppContext, "STATE");
 
     while(1)
